@@ -27,7 +27,7 @@
 ## Review Focus
 
 - A normal response lacks quota headers: previously displayed quota must become unavailable.
-- Account/session/provider changes: never display a previous context's observation as current.
+- Account/session/provider changes: clear the cache, invalidate request tags and reject responses crossing an observed authentication-change boundary.
 - Malformed or partially present numeric headers: display valid windows only, without inherited values.
 - No new response arrives: a local expiry timeout must clear the display without making requests.
 - Navigation/disposal races: late RPC results must not restore stale text or leak subscriptions.
@@ -73,10 +73,10 @@
 
 - [ ] **Step 1: Write failing fake-host tests** showing that an eligible OpenAI HTTP response updates the state, another provider does not, and a later response without quota headers clears it. Assert the original response/body is untouched and no generation, fetch, credential, storage or filesystem API is used.
 - [ ] **Step 2: Run those tests and confirm they fail because integration does not exist.**
-- [ ] **Step 3: Implement server setup** using the official `http.response` hook and documented session/provider context. Register snapshot RPC and empty update events. Invalidate state on authentication/integration changes and on disposal; abort the public-event subscription and dispose registrations on cleanup. If required APIs differ in installed SDK 2.3.0, resolve from its published types before implementing, not from the audited plugin.
+- [ ] **Step 3: Implement server setup** using `http.request` and `http.response` hooks scoped with `{providerID: "openai"}`. Tag Request objects in a WeakSet; never read request headers or bodies. Accept only a matching tagged response, then remove its tag. Authentication changes replace the WeakSet and clear state; mismatched request identity fails closed to unavailable. Register snapshot RPC and empty update events. Subscribe to `credential.updated`, `credential.switched`, `integration.updated`, `provider.updated` and `config.updated`; clear conservatively on these events, and on disposal. Abort the public-event subscription and dispose registrations on cleanup. Add tests for a pre-switch response arriving late and a response with unmatched request identity. Use published SDK 2.3.0 types, not the audited plugin.
 - [ ] **Step 4: Write failing footer-controller tests** for initial unavailable text, current-session refresh after updates, session/provider change clearing, RPC failure, local expiry without another response, and disposal/navigation during pending RPC. Test behavior through fake APIs, not source-code regex assertions.
 - [ ] **Step 5: Implement the footer contribution** with `append: "prompt.footer"` and host theme tokens. Read cached quota only for a currently selected OpenAI session. Use update events/navigation to refresh and a single local expiry timeout; no interval or network polling. Suppress late results after context changes/disposal. Keep JSX presentation minimal; extract lifecycle logic only if needed to exercise it without a live terminal.
-- [ ] **Step 6: Document security boundaries and limitations.** Explain unavailable quota for transports/auth methods without headers, HTTP-only observation, five-minute freshness, and the absence of active fetching. Describe manual local loading without editing user configuration. Document source transpilation by OpenCode and any build verification accurately.
+- [ ] **Step 6: Document security boundaries and limitations.** Explain unavailable quota for transports/auth methods without headers, HTTP-only observation, five-minute freshness, fail-closed request-identity matching, event-based invalidation limitations, and the absence of active fetching. Describe manual local loading without editing user configuration. Document source transpilation by OpenCode and any build verification accurately.
 - [ ] **Step 7: Verify `npm test`, `npm run typecheck`, the supported build check, and `npm pack --dry-run --ignore-scripts`.** Inspect the package file list, production imports, dependency lifecycle scripts, and git diff. Require no secrets, generated noise, audited-repository references in product code, or automatic installers. Live loading remains explicitly untested.
 - [ ] **Step 8: Commit the completed task.**
 
@@ -94,3 +94,14 @@ above and consumed unchanged. Each review-focus item has a behavioral test.
 The first version deliberately excludes active requests and WebSocket handling.
 The remaining builder choices are the host-compatible development versions and
 the smallest officially supported source-loading/type-check pipeline.
+
+## Confirmed SDK decisions
+
+Official SDK 2.3.0 exposes `event.sessionID`, `event.model.providerID`,
+`event.request` and `event.response` on HTTP response hooks, but no account
+identity. Hook registrations return an asynchronous `dispose()`. Source
+`.ts`/`.tsx` package exports are officially supported, so no bundler is needed.
+Pin development OpenTUI packages to `0.8.4` and Solid to `1.9.17`, matching SDK
+2.3.0's own development metadata; do not advertise untested OpenTUI 0.9 support.
+Use explicit RPC input/output schemas and top-level events despite looser prose
+in the current docs. Versioned SDK declarations take precedence.

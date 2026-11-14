@@ -53,6 +53,13 @@ compact indicator to the prompt footer. Updates are event-driven, not polled.
 Subscriptions, hooks, timers, and pending asynchronous UI results are cleaned up
 when the plugin unloads.
 
+The server also tags existing requests by object identity, without reading
+their headers or bodies. Authentication-change events invalidate those tags,
+so responses from already-running requests cannot restore a cleared observation.
+If the host does not preserve request identity between hooks, discard the
+response and remain unavailable. This is a fail-closed builder decision, not a
+claim that the SDK exposes an account identifier in response hooks.
+
 Use JSON Schema for RPC validation instead of adding a validation library.
 Use TypeScript and Node's built-in test runner. Pin development tooling and
 SDK peer versions after checking compatibility; do not run dependency lifecycle
@@ -75,3 +82,5 @@ WebSocket-only traffic is not observed by this first version. Normal generation
 must occur before quota can become available, and passive data can become stale.
 From-scratch implementation reduces reliance on the audited project but is not
 a guarantee of safety.
+Cache invalidation depends on public host events; the SDK does not document an
+account identity on response hooks or prove every possible disconnect event.
