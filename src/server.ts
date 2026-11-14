@@ -1,22 +1,58 @@
 import { Plugin } from "@opencode/plugin";
-import { createQuotaState } from "./quota.ts";
+import type { QuotaSnapshot } from "./quota.ts";
 import { Quota, sessionInput } from "./rpc.ts";
+import { fetchQuotaUsage } from "./usage.ts";
 
 export default Plugin.define({
   id: "opencode-quota-footer",
   async setup(ctx) {
-    const state = createQuotaState();
-    let requests = new WeakSet<Request>();
     const abort = new AbortController();
-    const registrations: Array<{ dispose(): Promise<void> }> = [];
     let rpc: Awaited<ReturnType<typeof ctx.rpc.register<typeof Quota>>> | undefined;
     let disposed = false;
-    let observing = false;
+    let observing = true;
     let streamFailed = false;
+    let generation = 0;
+    let identity: string | undefined;
+    let attemptedAt: number | undefined;
+    let cached: QuotaSnapshot = { windows: [], observedAt: null };
+    let pending: { abort: AbortController; done: Promise<void> } | undefined;
+    type Connection = Awaited<ReturnType<typeof ctx.integration.connection.active>>;
 
     function clear() {
-      requests = new WeakSet();
-      state.clear();
+      generation++;
+      pending?.abort.abort();
+      pending = undefined;
+      identity = undefined;
+      attemptedAt = undefined;
+      cached = { windows: [], observedAt: null };
+    }
+    function connectionID(connection: Connection) {
+      return connection?.type === "credential" && connection.method === "oauth" &&
+        typeof connection.id === "string" && connection.id ? connection.id : undefined;
+    }
+    function current(token: number) {
+      return !disposed && observing && generation === token;
+    }
+    async function sameConnection(id: string, token: number) {
+      const selected = await ctx.integration.connection.active("openai");
+      if (!current(token)) return false;
+      if (connectionID(selected) === id) return true;
+      clear();
+      return false;
+    }
+    async function load(connection: NonNullable<Connection>, id: string, token: number, signal: AbortSignal) {
+      try {
+        // The host may refresh its credential here; the plugin never redeems tokens.
+        const auth = await ctx.integration.connection.resolve(connection);
+        if (!current(token) || signal.aborted || auth?.type !== "oauth" ||
+          !["chatgpt-browser", "chatgpt-headless"].includes(auth.methodID) ||
+          typeof auth.metadata?.accountID !== "string") return;
+        if (!await sameConnection(id, token)) return;
+        const windows = await fetchQuotaUsage(auth.access, auth.metadata.accountID, signal);
+        if (await sameConnection(id, token) && current(token)) cached = { windows, observedAt: Date.now() };
+      } catch {
+        // Fail closed without carrying SDK errors or upstream content into RPC.
+      }
     }
     async function notify() {
       try {
@@ -32,7 +68,7 @@ export default Plugin.define({
       observing = false;
       clear();
       abort.abort();
-      await Promise.allSettled(registrations.map((registration) => registration.dispose()));
+      if (rpc) await Promise.allSettled([rpc.dispose()]);
     }
 
     try {
@@ -63,23 +99,50 @@ export default Plugin.define({
       })();
       rpc = await ctx.rpc.register(Quota, {
         async snapshot(input) {
-          return state.read(sessionInput(input), Date.now());
+          sessionInput(input);
+          const unavailable = { windows: [], observedAt: null };
+          let token = generation;
+          if (!current(token)) return unavailable;
+          try {
+            const connection = await ctx.integration.connection.active("openai");
+            if (!current(token)) return unavailable;
+            const id = connectionID(connection);
+            if (!id || !connection) {
+              clear();
+              return unavailable;
+            }
+            if (identity !== id) {
+              if (identity !== undefined) clear();
+              identity = id;
+              token = generation;
+            }
+            if (!pending && (attemptedAt === undefined || Date.now() - attemptedAt >= 60_000)) {
+              cached = unavailable;
+              attemptedAt = Date.now();
+              const request = new AbortController();
+              let cancel!: () => void;
+              const cancelled = new Promise<void>((resolve) => {
+                cancel = resolve;
+                request.signal.addEventListener("abort", cancel, { once: true });
+              });
+              const work = {
+                abort: request,
+                done: Promise.race([load(connection, id, token, request.signal), cancelled])
+                  .finally(() => request.signal.removeEventListener("abort", cancel)),
+              };
+              pending = work;
+              void work.done.finally(() => { if (pending === work) pending = undefined; });
+            }
+            await pending?.done;
+            if (!current(token) || !await sameConnection(id, token) || !current(token)) return unavailable;
+            if (cached.observedAt === null || Date.now() - cached.observedAt >= 300_000) return unavailable;
+            return { windows: cached.windows.map((window) => ({ ...window })), observedAt: cached.observedAt };
+          } catch {
+            if (current(token)) clear();
+            return unavailable;
+          }
         },
       });
-      registrations.push(rpc);
-      registrations.push(await ctx.session.hook("http.request", (event) => {
-        if (observing && event.model.providerID === "openai") requests.add(event.request);
-      }, { providerID: "openai" }));
-      registrations.push(await ctx.session.hook("http.response", (event) => {
-        if (!observing || event.model.providerID !== "openai") return;
-        if (requests.delete(event.request)) {
-          state.observe(event.sessionID, event.response.headers, Date.now());
-        } else {
-          // The SDK does not promise stable request identity; mismatches must fail closed.
-          state.clear();
-        }
-        void notify();
-      }, { providerID: "openai" }));
       observing = !streamFailed;
       return cleanup;
     } catch (error) {

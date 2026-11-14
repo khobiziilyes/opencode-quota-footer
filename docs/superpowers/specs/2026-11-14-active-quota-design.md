@@ -61,9 +61,12 @@ incrementally so the response size limit is real.
 Reuse TypeScript, built-in fetch/tests, existing RPC, theme and build checks.
 Use synthetic HTTP/host tests for all boundaries and races. Independent reviews
 must cover credential scoping, request limits, cache invalidation, polling and
-cleanup. After review, refresh the installed plugin through the documented
-location reload and query its snapshot without a model request; report actual
-normalized values. Do not mistake server activity for rendered UI verification.
+cleanup. After review, query the installed plugin's snapshot in a fresh,
+temporary local location without a model request; report actual normalized
+values. Let the user trigger `/reload` for the existing view: the public reload
+API rebuilds every loaded location and cancels pending permissions/forms, so
+do not invoke it automatically. Do not mistake server activity for rendered UI
+verification.
 
 ## Deliberate exclusions
 

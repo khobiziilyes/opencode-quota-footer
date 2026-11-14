@@ -32,8 +32,9 @@ async function loadTui(): Promise<Plugin.Definition> {
   return (source.namespace as { default: Plugin.Definition }).default;
 }
 
-test("real TUI entrypoint appends themed footer and reacts to session/model changes with cleanup", async () => {
+test("real TUI entrypoint appends themed footer, polls and reacts to session/model changes with cleanup", async (t) => {
   const tui = await loadTui();
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
   let claim: SlotClaim | undefined;
   let unmount = () => {};
   let unregistered = false;
@@ -81,14 +82,19 @@ test("real TUI entrypoint appends themed footer and reacts to session/model chan
   assert.equal(element.text, "Codex unavailable");
   await settle();
   assert.equal(element.text, "Codex 5h 80% left");
+  t.mock.timers.tick(60000);
+  await settle();
+  assert.deepEqual(calls, ["a", "a"]);
   setSessionID("b");
   assert.equal(element.text, "Codex unavailable");
   await settle();
-  assert.deepEqual(calls, ["a", "b"]);
+  assert.deepEqual(calls, ["a", "a", "b"]);
   setProviderID("other");
   assert.equal(element.text, "Codex unavailable");
   if (cleanup) await cleanup();
   assert.equal(unregistered, true);
   assert.equal(stopListener, true);
+  t.mock.timers.tick(600000);
+  assert.deepEqual(calls, ["a", "a", "b"]);
   events.end();
 });

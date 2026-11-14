@@ -129,7 +129,7 @@ test("newer updates supersede pending older RPC results", async () => {
   h.controller.dispose();
 });
 
-test("RPC failure clears without exposing raw errors or polling", async () => {
+test("RPC failure clears without exposing raw errors or immediate retries", async () => {
   const h = host();
   h.update();
   h.pending[0].resolve(available());
@@ -143,18 +143,86 @@ test("RPC failure clears without exposing raw errors or polling", async () => {
   h.controller.dispose();
 });
 
-test("one local timeout expires quota without another response or RPC", async (t) => {
+test("hard freshness expires quota even between minute reads", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
   const h = host();
   h.update();
-  h.pending[0].resolve(available(1000));
+  h.pending[0].resolve(available(-298999));
   await settle();
-  t.mock.timers.tick(299999);
   assert.equal(h.text, "Codex 5h 80% left");
   t.mock.timers.tick(1);
   assert.equal(h.text, "Codex unavailable");
   assert.equal(h.calls.length, 1);
   h.controller.dispose();
+});
+
+test("mounted OpenAI footer reads once per minute without model traffic", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = host();
+  t.after(() => h.controller.dispose());
+  h.update();
+  h.pending[0].resolve(available());
+  await settle();
+  t.mock.timers.tick(59999);
+  assert.equal(h.calls.length, 1);
+  t.mock.timers.tick(1);
+  assert.equal(h.calls.length, 2);
+  h.pending[1].resolve(available());
+  await settle();
+  assert.equal(h.text, "Codex 5h 80% left");
+  t.mock.timers.tick(60000);
+  assert.equal(h.calls.length, 3);
+});
+
+test("minute reads supersede pending RPCs and cannot restore late old values", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = host();
+  t.after(() => h.controller.dispose());
+  h.update();
+  t.mock.timers.tick(60000);
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[0].signal.aborted, true);
+  h.pending[1].resolve({ windows: [], observedAt: null });
+  h.pending[0].resolve(available());
+  await settle();
+  assert.equal(h.text, "Codex unavailable");
+});
+
+test("navigation and unload clear refresh and expiry work", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = host();
+  h.update();
+  h.pending[0].resolve(available());
+  await settle();
+  h.update("a", "other");
+  t.mock.timers.tick(600000);
+  assert.equal(h.calls.length, 1);
+  h.controller.update(undefined, "openai");
+  t.mock.timers.tick(600000);
+  assert.equal(h.calls.length, 1);
+  h.update();
+  h.pending[1].resolve(available());
+  await settle();
+  h.controller.dispose();
+  t.mock.timers.tick(600000);
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.text, "Codex unavailable");
+});
+
+test("auth invalidation discards old values and the next minute reads fresh data", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = host();
+  t.after(() => h.controller.dispose());
+  h.update();
+  h.event("credential.switched");
+  h.pending[0].resolve(available());
+  await settle();
+  assert.equal(h.text, "Codex unavailable");
+  t.mock.timers.tick(60000);
+  assert.equal(h.calls.length, 2);
+  h.pending[1].resolve(available());
+  await settle();
+  assert.equal(h.text, "Codex 5h 80% left");
 });
 
 for (const value of [
@@ -194,7 +262,8 @@ for (const type of ["credential.updated", "credential.switched", "integration.up
 }
 
 for (const failure of ["fail", "end"] as const) {
-  test(`RPC stream ${failure} clears, ignores in-flight data, and does not retry-poll`, async () => {
+  test(`RPC stream ${failure} clears, ignores in-flight data, and stops polling`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
     const h = host();
     h.update();
     h.subscriptions[0].events[failure]();
@@ -202,6 +271,7 @@ for (const failure of ["fail", "end"] as const) {
     h.pending[0].resolve(available());
     await settle();
     assert.equal(h.text, "Codex unavailable");
+    t.mock.timers.tick(600000);
     assert.equal(h.calls.length, 1);
     h.controller.dispose();
   });
@@ -221,6 +291,18 @@ for (const change of ["changeClient", "changeLocation"] as const) {
     await settle();
     assert.equal(h.text, "Codex 5h 80% left");
     h.controller.dispose();
+  });
+}
+
+for (const change of ["changeClient", "changeLocation"] as const) {
+  test(`${change} prevents minute reads using an obsolete client/location`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+    const h = host();
+    t.after(() => h.controller.dispose());
+    h.update();
+    h[change]();
+    t.mock.timers.tick(60000);
+    assert.equal(h.calls.length, 1);
   });
 }
 

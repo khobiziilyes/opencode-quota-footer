@@ -11,6 +11,7 @@ export function createFooterController(ctx: Plugin.Context, display: (text: stri
   let subscription: AbortController | undefined;
   let pending: AbortController | undefined;
   let expiry: ReturnType<typeof setTimeout> | undefined;
+  let polling: ReturnType<typeof setTimeout> | undefined;
 
   function clear() {
     clearTimeout(expiry);
@@ -22,6 +23,8 @@ export function createFooterController(ctx: Plugin.Context, display: (text: stri
     revision++;
     subscription?.abort();
     pending?.abort();
+    clearTimeout(polling);
+    polling = undefined;
     clear();
   }
   function update(nextSessionID: string | undefined, nextProviderID: string | undefined, read = true) {
@@ -81,6 +84,15 @@ export function createFooterController(ctx: Plugin.Context, display: (text: stri
       }
     })();
     if (read && current()) void refresh();
+    function poll() {
+      if (!current()) {
+        stop();
+        return;
+      }
+      void refresh();
+      polling = setTimeout(poll, 60_000);
+    }
+    if (current()) polling = setTimeout(poll, 60_000);
   }
 
   clear();
@@ -93,7 +105,7 @@ export function createFooterController(ctx: Plugin.Context, display: (text: stri
       case "config.updated":
       case "location.shutdown":
       case "server.connected":
-        // Live-only subscriptions may have missed an account change; wait for a fresh update.
+        // Live-only subscriptions may have missed an account change; discard old work.
         update(sessionID, providerID, false);
     }
   });
