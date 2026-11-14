@@ -180,6 +180,34 @@ for (const failure of ["http", "resolve", "schema", "stream"]) {
   });
 }
 
+for (const [phase, throwAt] of [["initial", 1], ["pre-fetch", 2], ["post-fetch", 3], ["final", 4]] as const) {
+  test(`${phase} identity lookup failure discards quota without resetting the attempt throttle`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+    const h = await host(t);
+    if (phase === "initial") await h.read();
+    let calls = 0;
+    h.active = async () => {
+      if (++calls === throwAt) throw Error("sensitive host lookup failure");
+      return connection();
+    };
+    assert.deepEqual(await h.read(), unavailable);
+    const requests = phase === "pre-fetch" ? 0 : 1;
+    assert.equal(h.requests.length, requests);
+    const next = await h.read({ sessionID: "b" });
+    assert.equal(h.requests.length, requests);
+    assert.deepEqual(next, unavailable);
+    assert.equal(h.resolutions.length, 1);
+    t.mock.timers.tick(59999);
+    assert.deepEqual(await h.read(), unavailable);
+    assert.equal(h.requests.length, requests);
+    assert.equal(h.resolutions.length, 1);
+    t.mock.timers.tick(1);
+    assert.deepEqual(await h.read(), { windows, observedAt: 61000 });
+    assert.equal(h.requests.length, requests + 1);
+    assert.equal(h.resolutions.length, 2);
+  });
+}
+
 test("active account switches without an event never reuse an earlier account's cache", async (t) => {
   const h = await host(t);
   await h.read();
@@ -269,25 +297,34 @@ test("invalidation during resolve suppresses old auth without discarding the new
 });
 
 for (const action of ["invalidate", "dispose"] as const) {
-  test(`${action} releases snapshots waiting for uncancellable SDK resolution`, async (t) => {
-    const h = await host(t);
-    const gate = deferred<unknown>();
-    h.resolve = () => gate.promise;
-    let returned = false;
-    const result = h.read().then((value) => { returned = true; return value; });
-    await settle();
-    if (action === "dispose") await h.cleanup();
-    else h.events.push({ type: "credential.switched" });
-    await settle();
-    try {
-      assert.equal(returned, true, "RPC must not wait for the host's uncancellable resolve");
-      assert.deepEqual(await result, unavailable);
-    } finally {
-      gate.resolve(credential());
-      await result;
-    }
-    assert.equal(h.requests.length, 0);
-  });
+  for (const phase of ["initial", "resolve", "pre-fetch", "post-fetch", "final", "cached-final"] as const) {
+    test(`${action} releases snapshots waiting for uncancellable SDK ${phase}`, async (t) => {
+      const h = await host(t);
+      const gate = deferred<unknown>();
+      if (phase === "cached-final") await h.read();
+      const checks = { initial: 1, "pre-fetch": 2, "post-fetch": 3, final: 4, "cached-final": 2 };
+      let calls = 0;
+      if (phase === "resolve") h.resolve = () => gate.promise;
+      else h.active = async () => ++calls === checks[phase] ? gate.promise : connection();
+      let returned = false;
+      const result = h.read().then((value) => { returned = true; return value; });
+      await settle();
+      const requests = phase === "post-fetch" || phase === "final" || phase === "cached-final" ? 1 : 0;
+      assert.equal(h.requests.length, requests);
+      if (action === "dispose") await h.cleanup();
+      else h.events.push({ type: "credential.switched" });
+      await settle();
+      try {
+        assert.equal(returned, true, `RPC must not wait for the host's uncancellable ${phase}`);
+        assert.deepEqual(await result, unavailable);
+      } finally {
+        gate.resolve(phase === "resolve" ? credential() : connection());
+        await result;
+      }
+      await settle();
+      assert.equal(h.requests.length, requests, "late host results must not start another GET");
+    });
+  }
 }
 
 test("invalidation during a pending final identity check cannot republish cached quota", async (t) => {
@@ -296,12 +333,18 @@ test("invalidation during a pending final identity check cannot republish cached
   let calls = 0;
   const gate = deferred<unknown>();
   h.active = async () => ++calls === 1 ? connection() : gate.promise;
-  const result = h.read();
+  let returned = false;
+  const result = h.read().then((value) => { returned = true; return value; });
   await settle();
   h.events.push({ type: "credential.switched" });
   await settle();
-  gate.resolve(connection());
-  assert.deepEqual(await result, unavailable);
+  try {
+    assert.equal(returned, true, "final lookup cancellation must not depend on releasing the host gate");
+    assert.deepEqual(await result, unavailable);
+  } finally {
+    gate.resolve(connection());
+    await result;
+  }
 });
 
 test("RPC input rejects malformed/extra fields before any credential resolution", async (t) => {

@@ -16,10 +16,13 @@ export default Plugin.define({
     let attemptedAt: number | undefined;
     let cached: QuotaSnapshot = { windows: [], observedAt: null };
     let pending: { abort: AbortController; done: Promise<void> } | undefined;
+    let lifecycle = new AbortController();
     type Connection = Awaited<ReturnType<typeof ctx.integration.connection.active>>;
 
     function clear() {
       generation++;
+      lifecycle.abort();
+      lifecycle = new AbortController();
       pending?.abort.abort();
       pending = undefined;
       identity = undefined;
@@ -33,8 +36,22 @@ export default Plugin.define({
     function current(token: number) {
       return !disposed && observing && generation === token;
     }
+    async function cancellable<T>(signal: AbortSignal, work: Promise<T>): Promise<T | undefined> {
+      let cancel!: () => void;
+      const cancelled = new Promise<undefined>((resolve) => {
+        cancel = () => resolve(undefined);
+        if (signal.aborted) cancel();
+        else signal.addEventListener("abort", cancel, { once: true });
+      });
+      try {
+        return await Promise.race([work, cancelled]);
+      } finally {
+        signal.removeEventListener("abort", cancel);
+      }
+    }
     async function sameConnection(id: string, token: number) {
-      const selected = await ctx.integration.connection.active("openai");
+      if (!current(token)) return false;
+      const selected = await cancellable(lifecycle.signal, ctx.integration.connection.active("openai"));
       if (!current(token)) return false;
       if (connectionID(selected) === id) return true;
       clear();
@@ -104,7 +121,7 @@ export default Plugin.define({
           let token = generation;
           if (!current(token)) return unavailable;
           try {
-            const connection = await ctx.integration.connection.active("openai");
+            const connection = await cancellable(lifecycle.signal, ctx.integration.connection.active("openai"));
             if (!current(token)) return unavailable;
             const id = connectionID(connection);
             if (!id || !connection) {
@@ -120,15 +137,9 @@ export default Plugin.define({
               cached = unavailable;
               attemptedAt = Date.now();
               const request = new AbortController();
-              let cancel!: () => void;
-              const cancelled = new Promise<void>((resolve) => {
-                cancel = resolve;
-                request.signal.addEventListener("abort", cancel, { once: true });
-              });
               const work = {
                 abort: request,
-                done: Promise.race([load(connection, id, token, request.signal), cancelled])
-                  .finally(() => request.signal.removeEventListener("abort", cancel)),
+                done: cancellable(request.signal, load(connection, id, token, request.signal)),
               };
               pending = work;
               void work.done.finally(() => { if (pending === work) pending = undefined; });
@@ -138,7 +149,7 @@ export default Plugin.define({
             if (cached.observedAt === null || Date.now() - cached.observedAt >= 300_000) return unavailable;
             return { windows: cached.windows.map((window) => ({ ...window })), observedAt: cached.observedAt };
           } catch {
-            if (current(token)) clear();
+            if (current(token)) cached = unavailable;
             return unavailable;
           }
         },
