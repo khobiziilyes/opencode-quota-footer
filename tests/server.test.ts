@@ -180,6 +180,64 @@ for (const failure of ["http", "resolve", "schema", "stream"]) {
   });
 }
 
+for (const outcome of ["success", "failure"] as const) {
+  test(`${outcome} attempts stay throttled through repeated same-account invalidations`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+    const h = await host(t);
+    if (outcome === "failure") h.fetch = async () => new Response(null, { status: 429 });
+    assert.deepEqual(await h.read(), outcome === "success" ? { windows, observedAt: 1000 } : unavailable);
+    t.mock.timers.tick(1000);
+    for (const type of [...invalidations, ...invalidations]) {
+      h.events.push({ type });
+      await settle();
+      const value = await h.read();
+      assert.equal(h.requests.length, 1, `${type} must not reset the GET throttle`);
+      assert.equal(h.resolutions.length, 1);
+      assert.deepEqual(value, unavailable, "invalidated quota must never be displayed");
+    }
+    t.mock.timers.tick(58999);
+    assert.deepEqual(await h.read(), unavailable);
+    assert.equal(h.requests.length, 1);
+    t.mock.timers.tick(1);
+    assert.deepEqual(await h.read(), outcome === "success" ? { windows, observedAt: 61000 } : unavailable);
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.resolutions.length, 2);
+  });
+
+  test(`${outcome} attempt followed by invalidation still permits a different account immediately`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+    const h = await host(t);
+    if (outcome === "failure") h.fetch = async () => new Response(null, { status: 429 });
+    await h.read();
+    h.events.push({ type: "credential.switched" });
+    await settle();
+    h.selected = connection("b");
+    h.auth = { ...credential(), metadata: { accountID: "fake-account-b" } };
+    const value = await h.read();
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.resolutions.length, 2);
+    assert.equal(new Headers(h.requests[1].options.headers).get("chatgpt-account-id"), "fake-account-b");
+    assert.deepEqual(value, outcome === "success" ? { windows, observedAt: 1000 } : unavailable);
+  });
+}
+
+for (const delay of [1000, 300000, 360001]) {
+  test(`post-fetch identity delay of ${delay}ms cannot advance quota observation time`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+    const h = await host(t);
+    const gate = deferred<unknown>();
+    let checks = 0;
+    h.active = async () => ++checks === 3 ? gate.promise : connection();
+    const result = h.read();
+    await settle();
+    assert.equal(checks, 3, "hold the identity check after the bounded quota read");
+    assert.equal(h.requests.length, 1);
+    t.mock.timers.tick(delay);
+    gate.resolve(connection());
+    assert.deepEqual(await result, delay < 300000 ? { windows, observedAt: 1000 } : unavailable);
+  });
+}
+
 for (const [phase, throwAt] of [["initial", 1], ["pre-fetch", 2], ["post-fetch", 3], ["final", 4]] as const) {
   test(`${phase} identity lookup failure discards quota without resetting the attempt throttle`, async (t) => {
     t.mock.timers.enable({ apis: ["Date"], now: 1000 });

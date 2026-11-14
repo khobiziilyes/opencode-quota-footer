@@ -25,8 +25,7 @@ export default Plugin.define({
       lifecycle = new AbortController();
       pending?.abort.abort();
       pending = undefined;
-      identity = undefined;
-      attemptedAt = undefined;
+      // Keep the same-connection attempt bound across public invalidations.
       cached = { windows: [], observedAt: null };
     }
     function connectionID(connection: Connection) {
@@ -66,7 +65,8 @@ export default Plugin.define({
           typeof auth.metadata?.accountID !== "string") return;
         if (!await sameConnection(id, token)) return;
         const windows = await fetchQuotaUsage(auth.access, auth.metadata.accountID, signal);
-        if (await sameConnection(id, token) && current(token)) cached = { windows, observedAt: Date.now() };
+        const observedAt = Date.now();
+        if (await sameConnection(id, token) && current(token)) cached = { windows, observedAt };
       } catch {
         // Fail closed without carrying SDK errors or upstream content into RPC.
       }
@@ -131,6 +131,7 @@ export default Plugin.define({
             if (identity !== id) {
               if (identity !== undefined) clear();
               identity = id;
+              attemptedAt = undefined;
               token = generation;
             }
             if (!pending && (attemptedAt === undefined || Date.now() - attemptedAt >= 60_000)) {
